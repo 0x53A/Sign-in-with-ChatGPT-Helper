@@ -1,0 +1,30 @@
+name: Check
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev pkg-config
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.95.0
+          npm ci
+          npx playwright install --with-deps chromium
+      - run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo build --locked --examples
+          npm test
+          npm run build
+          WEB_ROOT=target/pages npm run test:browser
