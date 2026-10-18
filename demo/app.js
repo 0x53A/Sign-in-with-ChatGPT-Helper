@@ -1,3 +1,4 @@
+import {connectProxy, closeProxy, proxyConnected, proxyConnecting, onProxyChange} from './proxy.js';
 import {createRequest, acceptResponse, connected, offlinePending, models, inference, disconnect} from './client.js';
 import {zip, unzip} from './zip.js';
 const $ = id => document.getElementById(id);
@@ -13,8 +14,11 @@ function draw() {
   $('cancel').hidden = !pairing;
   for (const id of ['connect', 'request', 'response', 'port']) $(id).disabled = busy;
   $('disconnect').disabled = busy || (!signedIn && !unreadable);
-  $('reload').disabled = $('model').disabled = busy || !signedIn;
-  $('send').disabled = busy || !signedIn || !$('model').value;
+  $('proxy-connect').disabled = busy || proxyConnected();
+  $('proxy-stop').hidden = !proxyConnected() && !proxyConnecting();
+  $('proxy-port').disabled = busy || proxyConnected();
+  $('reload').disabled = $('model').disabled = busy || !signedIn || !proxyConnected();
+  $('send').disabled = busy || !signedIn || !proxyConnected() || !$('model').value;
 }
 async function run(fn) { if (busy) return; busy = true; draw(); try { await fn(); } catch (e) { status(e.message); } finally { busy = false; draw(); } }
 async function catalog() {
@@ -31,8 +35,10 @@ async function catalog() {
 async function received(value) {
   if (!value || typeof value !== 'object') throw Error('Invalid helper response.');
   if (value.error) throw Error('Login did not complete. Check the helper.');
-  await acceptResponse(value); signedIn = true; flow = null; $('pair').hidden = true; draw();
-  status('Loading models…'); await catalog(); status('');
+  await acceptResponse(value);
+  if (flow === 'online') $('proxy-port').value = $('port').value;
+  signedIn = true; flow = null; $('pair').hidden = true; draw();
+  status('Connect the proxy to load models and send messages.');
 }
 $('connect').onclick = () => run(async () => {
   flow = 'online'; pairing = new AbortController(); draw();
@@ -81,6 +87,16 @@ $('response').onchange = () => run(async () => {
   if (file.size > 262144) throw Error('Response file is too large.');
   await received(JSON.parse(unzip(new Uint8Array(await file.arrayBuffer()), 'response.json')));
 });
+onProxyChange(connected => {
+  if (!connected && !proxyConnecting() && signedIn) status('Proxy disconnected. Connect and approve a new session.');
+  draw();
+});
+$('proxy-connect').onclick = () => run(async () => {
+  status('Approve this proxy session in the helper. Close the login result first if needed.');
+  await connectProxy(Number($('proxy-port').value));
+  await catalog(); status('Proxy connected.');
+});
+$('proxy-stop').onclick = closeProxy;
 $('model').onchange = draw;
 $('reload').onclick = () => run(async () => { await catalog(); status('Models loaded.'); });
 $('send').onclick = () => run(async () => {
@@ -94,8 +110,11 @@ $('disconnect').onclick = () => run(async () => {
 });
 await run(async () => {
   try { signedIn = await connected(); }
-  catch { unreadable = true; throw Error('Saved login could not be read. Log out to clear it.'); }
+  catch (error) {
+    if (error.message.includes('Close other demo tabs')) throw error;
+    unreadable = true; throw Error('Saved login could not be read. Log out to clear it.');
+  }
   if (!signedIn && await offlinePending()) flow = 'offline';
   draw();
-  if (signedIn) { await catalog(); status(''); }
+  if (signedIn) status('Connect the proxy to load models and send messages.');
 });

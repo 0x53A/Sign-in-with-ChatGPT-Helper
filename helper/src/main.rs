@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use chatgpt_login_helper::{
-    protocol,
+    protocol, proxy,
     server::{self, Delivery, Event, Pending},
 };
 use eframe::egui;
@@ -19,6 +19,10 @@ struct Row {
     pin: String,
     attempts: u8,
 }
+struct ProxyRow {
+    pending: proxy::Pending,
+    approved: bool,
+}
 struct App {
     events: mpsc::Receiver<Event>,
     tx: mpsc::Sender<Event>,
@@ -28,6 +32,7 @@ struct App {
     listening_port: Option<u16>,
     allow: bool,
     requests: Vec<Row>,
+    proxies: Vec<ProxyRow>,
     active: Option<u64>,
     cancelled: Option<Arc<AtomicBool>>,
     result: Option<Result<Delivery, String>>,
@@ -74,9 +79,10 @@ fn theme(ctx: &egui::Context) {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, port: u16) -> Self {
         theme(&cc.egui_ctx);
         let mut app = Self::idle();
+        app.port = port.to_string();
         app.listen();
         app
     }
@@ -91,6 +97,7 @@ impl App {
             listening_port: None,
             allow: true,
             requests: Vec::new(),
+            proxies: Vec::new(),
             active: None,
             cancelled: None,
             result: None,
@@ -101,6 +108,16 @@ impl App {
     fn receive(&mut self) {
         while let Ok(event) = self.events.try_recv() {
             match event {
+                Event::Proxy(pending) => {
+                    if self.active.is_some() || !self.allow {
+                        pending.session.stop();
+                    } else {
+                        self.proxies.push(ProxyRow {
+                            pending,
+                            approved: false,
+                        });
+                    }
+                }
                 Event::Pending(p) => {
                     if self.active.is_some() || !self.allow {
                         reject(&p);
@@ -129,11 +146,19 @@ impl App {
         }
     }
     fn reject_all(&mut self) {
+        for row in &self.proxies {
+            if !row.approved {
+                row.pending.session.stop();
+            }
+        }
         for row in self.requests.drain(..) {
             reject(&row.pending);
         }
     }
     fn listen(&mut self) {
+        for row in self.proxies.drain(..) {
+            row.pending.session.stop();
+        }
         self.listener = None;
         self.listening_port = None;
         self.reject_all();
@@ -281,6 +306,7 @@ impl App {
                     ui.label(&self.status);
                 }
             }
+            self.proxy_list(ui);
             return;
         }
         ui.horizontal(|ui| {
@@ -353,10 +379,64 @@ impl App {
         if let Some(index) = accept {
             self.accept(index);
         }
+        self.proxy_list(ui);
         if !self.status.is_empty() {
             ui.add_space(16.0);
             ui.label(&self.status);
         }
+    }
+    fn proxy_list(&mut self, ui: &mut egui::Ui) {
+        self.proxies
+            .retain(|r| !r.pending.session.stopped.load(Ordering::SeqCst));
+        if self.proxies.is_empty() {
+            return;
+        }
+        ui.add_space(16.0);
+        ui.separator();
+        ui.label("Proxy sessions");
+        egui::ScrollArea::vertical()
+            .id_salt("proxies")
+            .max_height(180.0)
+            .show(ui, |ui| {
+                for row in &mut self.proxies {
+                    ui.push_id(row.pending.session.id, |ui| {
+                        ui.label(&row.pending.session.origin);
+                        ui.horizontal(|ui| {
+                            let mut limited = row.pending.session.limited.load(Ordering::SeqCst);
+                            if ui
+                                .checkbox(&mut limited, "Rate limit")
+                                .on_hover_text("30 requests/minute, two at a time")
+                                .changed()
+                            {
+                                row.pending.session.limited.store(limited, Ordering::SeqCst);
+                            }
+                            if row.approved {
+                                ui.weak(format!(
+                                    "{} requests",
+                                    row.pending.session.requests.load(Ordering::SeqCst)
+                                ));
+                                if ui.button("Stop").clicked() {
+                                    row.pending.session.stop();
+                                }
+                            } else {
+                                if ui
+                                    .add_enabled(
+                                        self.active.is_none(),
+                                        egui::Button::new("Approve"),
+                                    )
+                                    .clicked()
+                                {
+                                    row.approved = row.pending.answer.send(true).is_ok();
+                                }
+                                if ui.button("Reject").clicked() {
+                                    row.pending.session.stop();
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
+                    });
+                }
+            });
     }
 }
 fn reject(p: &Pending) {
@@ -372,18 +452,25 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(root, |ui| {
             let width = 480.0_f32.min(ui.available_width() - 32.0);
             let height = if self.active.is_some() {
-                240.0
+                240.0 + if self.proxies.is_empty() { 0.0 } else { 150.0 }
             } else {
-                (250.0 + self.requests.len() as f32 * 72.0).min(530.0)
+                (250.0 + self.requests.len() as f32 * 72.0 + self.proxies.len() as f32 * 80.0)
+                    .min(530.0)
             };
             let top = ((ui.available_height() - height) / 2.0).max(24.0);
             ui.add_space(top);
+            let remaining_height = ui.available_height();
             ui.horizontal(|ui| {
                 ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
                 ui.allocate_ui_with_layout(
-                    egui::vec2(width, height),
+                    egui::vec2(width, remaining_height),
                     egui::Layout::top_down(egui::Align::Min),
-                    |ui| self.content(ui),
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("content")
+                            .max_height(ui.available_height())
+                            .show(ui, |ui| self.content(ui));
+                    },
                 );
             });
         });
@@ -392,6 +479,9 @@ impl eframe::App for App {
 }
 impl Drop for App {
     fn drop(&mut self) {
+        for row in &self.proxies {
+            row.pending.session.stop();
+        }
         self.reject_all();
         if let Some(cancelled) = &self.cancelled {
             cancelled.store(true, Ordering::SeqCst);
@@ -399,6 +489,16 @@ impl Drop for App {
     }
 }
 fn main() -> eframe::Result {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let port = match args.as_slice() {
+        [] => Some(protocol::DEFAULT_PORT),
+        [flag, value] if flag == "--port" => value.parse::<u16>().ok().filter(|p| *p != 0),
+        _ => None,
+    };
+    let Some(port) = port else {
+        eprintln!("Usage: chatgpt-login-helper [--port 1..65535]");
+        std::process::exit(2);
+    };
     eframe::run_native(
         "Login with OpenAI — Helper",
         eframe::NativeOptions {
@@ -407,7 +507,7 @@ fn main() -> eframe::Result {
                 .with_min_inner_size([540.0, 440.0]),
             ..Default::default()
         },
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(|cc| Ok(Box::new(App::new(cc, port)))),
     )
 }
 
@@ -417,7 +517,7 @@ mod tests {
     fn incoming(id: u64) -> (Pending, mpsc::Receiver<bool>) {
         let (answer, receiver) = mpsc::channel();
         let request = protocol::Request {
-            version: 1,
+            version: 2,
             request_id: protocol::random().unwrap(),
             app_name: "Test app".into(),
             origin: "https://example.org".into(),

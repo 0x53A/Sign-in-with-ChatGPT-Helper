@@ -3,7 +3,7 @@ process.chdir(fileURLToPath(new URL('..', import.meta.url)));
 import {readFile, writeFile, mkdir, copyFile, rm} from 'node:fs/promises';
 import {createHash} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
-const out = 'demo/dist', files = ['index.html', 'style.css', 'app.js', 'client.js', 'zip.js'];
+const out = 'demo/dist', files = ['index.html', 'style.css', 'app.js', 'client.js', 'proxy.js', 'zip.js'];
 await rm(out, {recursive:true, force:true});
 await mkdir(out, {recursive:true});
 const hashes = {};

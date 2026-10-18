@@ -14,7 +14,9 @@ fn main() -> anyhow::Result<()> {
         scope: SCOPES.join(" "),
         expires_at: protocol::now() + 3600,
     };
-    let result = protocol::encrypt(&raw, &request, &tokens)?;
+    let key = chatgpt_login_helper::vault::Key::generate()?;
+    let credentials = key.seal(&request.origin, tokens)?;
+    let result = protocol::encrypt(&raw, &request, &credentials)?;
     std::fs::write(
         &args[2],
         protocol::package("response.json", &serde_json::to_string(&result)?)?,

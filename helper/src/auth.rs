@@ -23,12 +23,7 @@ struct Registration {
 }
 
 fn path() -> Result<PathBuf> {
-    let root = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
-        .context("Cannot locate configuration directory")?;
-    Ok(root.join("chatgpt-login-helper/registrations.json"))
+    Ok(crate::vault::directory(false)?.join("registrations.json"))
 }
 fn registrations() -> Result<BTreeMap<String, Registration>> {
     match fs::read(path()?) {

@@ -13,7 +13,7 @@ test('static build excludes stale artifacts and hashes every deployed asset', as
     const demo = join(root, 'demo'), out = join(demo, 'dist');
     await mkdir(out, {recursive:true});
     await copyFile(new URL('../demo/build.mjs', import.meta.url), join(demo, 'build.mjs'));
-    const assets = ['index.html', 'style.css', 'app.js', 'client.js', 'zip.js'];
+    const assets = ['index.html', 'style.css', 'app.js', 'client.js', 'proxy.js', 'zip.js'];
     for (const name of assets) await writeFile(join(demo, name), 'fixture:' + name);
     await writeFile(join(out, 'old-attestation.jsonl'), 'stale');
     const env = {...process.env};

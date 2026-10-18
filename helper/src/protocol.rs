@@ -83,7 +83,7 @@ impl Request {
     pub fn parse(raw: &str) -> Result<Self> {
         ensure!(raw.len() <= LIMIT, "Request too large");
         let request: Self = serde_json::from_str(raw).context("Invalid request JSON")?;
-        ensure!(request.version == 1, "Unsupported protocol version");
+        ensure!(request.version == 2, "Unsupported protocol version");
         ensure!(
             B64.decode(&request.request_id).is_ok_and(|v| v.len() == 32),
             "Invalid request ID"
@@ -176,7 +176,11 @@ pub struct Envelope {
     pub ciphertext: String,
 }
 
-pub fn encrypt(raw: &str, request: &Request, tokens: &Tokens) -> Result<Envelope> {
+pub fn encrypt(
+    raw: &str,
+    request: &Request,
+    credentials: &crate::vault::Credentials,
+) -> Result<Envelope> {
     ensure!(
         request.expires_at > now(),
         "Request expired before delivery"
@@ -186,8 +190,8 @@ pub fn encrypt(raw: &str, request: &Request, tokens: &Tokens) -> Result<Envelope
     rand::fill(&mut key)?;
     rand::fill(&mut iv)?;
     let request_hash = hash(raw.as_bytes());
-    let aad = format!("chatgpt-helper-v1:{}:{}", request.request_id, request_hash);
-    let mut ciphertext = serde_json::to_vec(tokens)?;
+    let aad = format!("chatgpt-helper-v2:{}:{}", request.request_id, request_hash);
+    let mut ciphertext = serde_json::to_vec(credentials)?;
     LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key)?).seal_in_place_append_tag(
         Nonce::assume_unique_for_key(iv),
         Aad::from(aad.as_bytes()),
@@ -197,7 +201,7 @@ pub fn encrypt(raw: &str, request: &Request, tokens: &Tokens) -> Result<Envelope
     let mut wrapped = vec![0; recipient.ciphertext_size()];
     recipient.encrypt(&OAEP_SHA256_MGF1SHA256, &key, &mut wrapped, None)?;
     Ok(Envelope {
-        version: 1,
+        version: 2,
         request_id: request.request_id.clone(),
         request_hash,
         wrapped_key: B64.encode(wrapped),

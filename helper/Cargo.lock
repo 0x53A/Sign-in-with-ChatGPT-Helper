@@ -348,6 +348,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tiny_http",
+ "tokio",
  "tungstenite",
  "url",
  "webbrowser",

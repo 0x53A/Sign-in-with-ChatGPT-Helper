@@ -11,19 +11,35 @@ const dir = resolve('tests/artifacts/browser-test'); await mkdir(dir, {recursive
 const server = await serve(process.env.WEB_ROOT || 'demo', 0), origin = `http://127.0.0.1:${server.address().port}`;
 const browser = await chromium.launch({executablePath:process.env.CHROMIUM || undefined, headless:true, args:['--no-sandbox']});
 const context = await browser.newContext({acceptDownloads:true, viewport:{width:1000,height:900}});
-let refreshes = 0;
-await context.route('https://api.openai.com/v1/models', route => route.fulfill({json:{models:[{visibility:'list', slug:'test-model', display_name:'Test model'}]}}));
-await context.route('https://api.openai.com/v1/responses', async route => {
-  const body = route.request().postDataJSON(); assert.equal(body.store, false); assert.equal(body.stream, true); assert.equal(body.model, 'test-model');
-  await route.fulfill({contentType:'text/event-stream', body:'data: {"type":"response.output_text.delta","delta":"Hello from the fixture."}\n\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n'});
+let refreshes = 0, fixtureCredentials, catalogFails = false, proxySessions = 0;
+await context.route('https://**', () => { throw Error('Browser must never send credentials directly to OpenAI'); });
+await context.routeWebSocket(/ws:\/\/127\.0\.0\.1:\d+\/proxy$/, ws => {
+  proxySessions++;
+  ws.send(JSON.stringify({type:'ready',protocol:1}));
+  const reply = (id, body, status = 200) => {
+    ws.send(JSON.stringify({id,type:'headers',status,content_type:'application/json'}));
+    const prefix = Buffer.alloc(4); prefix.writeUInt32BE(id);
+    ws.send(Buffer.concat([prefix, Buffer.from(body)])); ws.send(JSON.stringify({id,type:'end'}));
+  };
+  ws.onMessage(raw => {
+    const {type, id, request} = JSON.parse(raw);
+    if (type === 'cancel') return;
+    assert.equal(type, 'request');
+    assert.equal(request.credentials.version, 2);
+    assert.equal('token' in request, false);
+    assert.equal(raw.includes('synthetic-access') || raw.includes('synthetic-refresh'), false);
+    if (request.endpoint === 'models') reply(id, JSON.stringify(catalogFails ? {error:{code:'test_catalog_unavailable'}} : {models:[{visibility:'list',slug:'test-model',display_name:'Test model'}]}), catalogFails ? 503 : 200);
+    else if (request.endpoint === 'responses') {
+      assert.equal(request.body.store, false); assert.equal(request.body.stream, true);
+      assert.equal(request.body.model, catalogFails ? 'gpt-6.1-sol' : 'test-model');
+      reply(id, 'data: {"type":"response.output_text.delta","delta":"Hello from the fixture."}\n\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n');
+    } else if (request.endpoint === 'refresh') {
+      refreshes++;
+      ws.send(JSON.stringify({id,type:'credentials',credentials:{...fixtureCredentials,expires_at:Math.floor(Date.now()/1000)+3600}}));
+    } else if (request.endpoint === 'revoke') ws.send(JSON.stringify({id,type:'revoked'}));
+    else throw Error('Unexpected proxy operation');
+  });
 });
-await context.route('https://auth.openai.com/api/accounts/oauth/token', async route => {
-  const form = new URLSearchParams(route.request().postData());
-  assert.equal(form.get('grant_type'), 'refresh_token'); assert.equal(form.get('refresh_token'), 'synthetic-refresh'); assert.equal(form.get('client_id'), 'oaiapp_test');
-  refreshes++;
-  await route.fulfill({json:{access_token:'renewed-access', refresh_token:'renewed-refresh', token_type:'Bearer', expires_in:3600, scope:'openid resource.invoke chatgpt.tokens.use.direct offline_access'}});
-});
-await context.route('https://auth.openai.com/api/accounts/oauth/revoke', route => route.fulfill({status:200, body:''}));
 try {
   const page = await context.newPage(); const errors = []; page.on('pageerror', error => errors.push(error.message));
   await page.goto(origin);
@@ -71,23 +87,20 @@ try {
   await page.waitForFunction(()=>!document.querySelector('#offline').hidden);
   await page.screenshot({path:dir+'/offline.png'});
   await page.setInputFiles('#response', `${dir}/response.zip`);
-  await page.waitForFunction(() => !document.querySelector('#success').hidden && !document.querySelector('#send').disabled);
+  await page.waitForFunction(() => !document.querySelector('#success').hidden && !document.querySelector('#proxy-connect').disabled);
+  await page.click('#proxy-connect');
+  await page.waitForFunction(() => !document.querySelector('#send').disabled);
   assert.equal(await page.locator('#login').isVisible(), false);
   await page.fill('#prompt', 'Hello'); await page.click('#send');
   await page.waitForFunction(() => document.querySelector('#status').textContent === 'Complete.');
   assert.equal(await page.locator('#output').textContent(), 'Hello from the fixture.');
   // A blocked catalog must still allow testing the inference endpoint.
-  await page.route('https://api.openai.com/v1/models', route => route.abort());
-  await page.route('https://api.openai.com/v1/responses', async route => {
-    assert.equal(route.request().postDataJSON().model, 'gpt-6.1-sol');
-    await route.fulfill({contentType:'text/event-stream', body:'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'});
-  });
+  catalogFails = true;
   await page.click('#reload');
   await page.waitForFunction(()=>!document.querySelector('#send').disabled && document.querySelector('#model').value === 'gpt-6.1-sol');
   await page.click('#send');
   await page.waitForFunction(()=>document.querySelector('#status').textContent === 'Complete.');
-  await page.unroute('https://api.openai.com/v1/models');
-  await page.unroute('https://api.openai.com/v1/responses');
+  catalogFails = false;
   await page.click('#reload');
   await page.waitForFunction(()=>document.querySelector('#status').textContent === 'Models loaded.');
   await page.screenshot({path:`${dir}/desktop.png`});
@@ -98,20 +111,20 @@ try {
     try { await (await import('./client.js')).acceptResponse(envelope); return false; }
     catch(e) { return e.message.includes('No pending request'); }
   }, envelope), true);
-  const stored = await page.evaluate(async () => {
+  fixtureCredentials = await page.evaluate(async () => {
     const db=await new Promise(resolve=>{const r=indexedDB.open('chatgpt-helper-demo-v1');r.onsuccess=()=>resolve(r.result);});
-    const get=k=>new Promise(resolve=>{const r=db.transaction('kv').objectStore('kv').get(k);r.onsuccess=()=>resolve(r.result);});
-    const key=await get('key'), record=await get('session');
-    const payload=JSON.parse(new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:record.iv,additionalData:new TextEncoder().encode('session:v1')},key,record.data)));
-    payload.expires_at=0;
-    const data=await crypto.subtle.encrypt({name:'AES-GCM',iv:crypto.getRandomValues(record.iv),additionalData:new TextEncoder().encode('session:v1')},key,new TextEncoder().encode(JSON.stringify(payload)));
-    await new Promise(resolve=>{const tx=db.transaction('kv','readwrite');tx.objectStore('kv').put({iv:record.iv,data},'session');tx.oncomplete=resolve;});
-    return {extractable:key.extractable, encrypted:record.data instanceof ArrayBuffer};
+    const credentials=await new Promise(resolve=>{const r=db.transaction('kv').objectStore('kv').get('session');r.onsuccess=()=>resolve(r.result);});
+    await new Promise(resolve=>{const tx=db.transaction('kv','readwrite');tx.objectStore('kv').put({...credentials,expires_at:0},'session');tx.oncomplete=resolve;});
+    return credentials;
   });
-  assert.deepEqual(stored,{extractable:false,encrypted:true});
+  assert.equal(fixtureCredentials.bundle.version, 2);
+  assert.equal(JSON.stringify(fixtureCredentials).includes('synthetic'), false, 'JS never receives bearer credentials');
   const second=await context.newPage(); await Promise.all([page.reload(),second.goto(origin)]);
-  await Promise.all([page.waitForFunction(()=>!document.querySelector('#success').hidden && !document.querySelector('#send').disabled), second.waitForFunction(()=>!document.querySelector('#success').hidden && !document.querySelector('#send').disabled)]);
+  for (const tab of [page,second]) await tab.waitForFunction(()=>!document.querySelector('#proxy-connect').disabled);
+  await Promise.all([page.click('#proxy-connect'),second.click('#proxy-connect')]);
+  await Promise.all([page.waitForFunction(()=>!document.querySelector('#send').disabled), second.waitForFunction(()=>!document.querySelector('#send').disabled)]);
   assert.equal(refreshes,1,'refresh rotation must serialize across tabs');
+  assert.equal(proxySessions,3,'reload and each tab require a new approval');
   // An ambiguous refresh must never retry the rotated token.
   assert.equal(await page.evaluate(async () => {
     const db=await new Promise(resolve=>{const r=indexedDB.open('chatgpt-helper-demo-v1');r.onsuccess=()=>resolve(r.result);});
@@ -140,6 +153,25 @@ try {
     const db=await new Promise(resolve=>{const r=indexedDB.open('chatgpt-helper-demo-v1');r.onsuccess=()=>resolve(r.result);});
     return await new Promise(resolve=>{const r=db.transaction('kv').objectStore('kv').get('session');r.onsuccess=()=>resolve(r.result === undefined);});
   }), true);
+  // An old v1 tab must explain a blocked upgrade, then discard old raw tokens.
+  const upgradeContext = await browser.newContext();
+  await upgradeContext.route(origin + '/upgrade-fixture', route => route.fulfill({contentType:'text/html',body:'<title>Storage fixture</title>'}));
+  const oldTab = await upgradeContext.newPage(); await oldTab.goto(origin + '/upgrade-fixture');
+  await oldTab.evaluate(async () => {
+    const db = await new Promise(resolve => { const r = indexedDB.open('chatgpt-helper-demo-v1',1); r.onupgradeneeded=()=>r.result.createObjectStore('kv'); r.onsuccess=()=>resolve(r.result); });
+    globalThis.heldDatabase = db;
+    await new Promise(resolve=>{const tx=db.transaction('kv','readwrite');tx.objectStore('kv').put({access_token:'legacy-secret'},'session');tx.oncomplete=resolve;});
+  });
+  const upgraded = await upgradeContext.newPage(); await upgraded.goto(origin);
+  await upgraded.waitForFunction(()=>document.querySelector('#status').textContent.includes('Close other demo tabs'));
+  await oldTab.close(); await upgraded.reload();
+  await upgraded.waitForFunction(()=>!document.querySelector('#connect').disabled);
+  assert.equal(await upgraded.locator('#login').isVisible(),true);
+  assert.equal(await upgraded.evaluate(async()=>{
+    const db=await new Promise(resolve=>{const r=indexedDB.open('chatgpt-helper-demo-v1');r.onsuccess=()=>resolve(r.result);});
+    return await new Promise(resolve=>{const r=db.transaction('kv').objectStore('kv').get('session');r.onsuccess=()=>resolve(r.result===undefined);});
+  }), true);
+  await upgradeContext.close();
   assert.deepEqual(errors,[]);
   console.log('Browser: Rust/WebCrypto ZIP interoperability, non-extractable keys, reload, replay rejection, refresh rotation, inference and layouts passed.');
 } finally { await browser.close(); await new Promise(resolve=>server.close(resolve)); }

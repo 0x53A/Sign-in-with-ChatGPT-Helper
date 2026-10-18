@@ -3,7 +3,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' ws://127.0.0.1:* https://auth.openai.com https://api.openai.com; img-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' ws://127.0.0.1:*; img-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
 <title>Login with OpenAI · Demo</title>
 <link rel="stylesheet" href="style.css">
 <main>
@@ -20,7 +20,7 @@
     </div>
     <div id="success" class="row" hidden><strong id="login-state">Login Success</strong><button id="disconnect">Logout</button></div>
   </section>
-  <section id="inference" aria-label="Inference" hidden><div class="row"><label class="grow">Model <select id="model" disabled><option value="">Loading models…</option></select></label><button id="reload" disabled>Reload models</button></div>
+  <section id="inference" aria-label="Inference" hidden><div class="row"><label>Helper port <input id="proxy-port" type="number" min="1" max="65535" value="17653"></label><button id="proxy-connect">Connect proxy</button><button id="proxy-stop" hidden>Disconnect proxy</button></div><div class="row"><label class="grow">Model <select id="model" disabled><option value="">Loading models…</option></select></label><button id="reload" disabled>Reload models</button></div>
     <label>Message <textarea id="prompt" rows="3" placeholder="Ask something…"></textarea></label><button id="send" disabled>Send</button>
     <pre id="output" aria-live="polite"></pre>
   </section>

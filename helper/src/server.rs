@@ -3,6 +3,7 @@
 use crate::{
     auth,
     protocol::{self, Envelope, LIMIT, Request},
+    proxy, vault,
 };
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -10,7 +11,7 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Sender},
     },
     thread,
@@ -36,6 +37,7 @@ pub enum Delivery {
 }
 pub enum Event {
     Pending(Pending),
+    Proxy(proxy::Pending),
     Status(u64, String, Option<String>),
     Finished(u64, Result<Delivery, String>),
 }
@@ -51,16 +53,9 @@ impl Drop for Listener {
         }
     }
 }
-struct Connection(Arc<AtomicUsize>);
-impl Drop for Connection {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 fn handshake_origin(req: &Handshake, port: u16) -> Result<String> {
     ensure!(
-        req.uri().path() == "/pair" && req.uri().query().is_none(),
+        matches!(req.uri().path(), "/pair" | "/proxy") && req.uri().query().is_none(),
         "Invalid WebSocket path"
     );
     ensure!(
@@ -88,22 +83,18 @@ pub fn start(port: u16, events: Sender<Event>, busy: Arc<AtomicBool>) -> Result<
     listener.set_nonblocking(true)?;
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
-    let connections = Arc::new(AtomicUsize::new(0));
     let thread = thread::spawn(move || {
         while !stopped.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    if busy.load(Ordering::SeqCst) || connections.load(Ordering::SeqCst) >= 16 {
+                    if busy.load(Ordering::SeqCst) {
                         drop(stream);
                         continue;
                     }
-                    connections.fetch_add(1, Ordering::SeqCst);
-                    let guard = Connection(connections.clone());
                     let events = events.clone();
                     let stopped = stopped.clone();
                     let busy = busy.clone();
                     thread::spawn(move || {
-                        let _guard = guard;
                         let _ = online(stream, port, &events, stopped, busy);
                     });
                 }
@@ -182,7 +173,8 @@ fn exchange(
             !disconnected() && !cancelled.load(Ordering::SeqCst),
             "Connection closed before delivery"
         );
-        protocol::encrypt(raw, &request, &tokens)
+        let credentials = vault::installation()?.seal(&request.origin, tokens)?;
+        protocol::encrypt(raw, &request, &credentials)
     })();
     cancelled.store(true, Ordering::SeqCst);
     outcome
@@ -198,11 +190,13 @@ fn online(
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut origin = String::new();
+    let mut is_proxy = false;
     let mut socket = tungstenite::accept_hdr_with_config(
         stream,
         |request: &Handshake, response: Response| match handshake_origin(request, port) {
             Ok(value) => {
                 origin = value;
+                is_proxy = request.uri().path() == "/proxy";
                 Ok(response)
             }
             Err(_) => Err(tungstenite::http::Response::builder()
@@ -212,11 +206,21 @@ fn online(
         },
         Some(
             WebSocketConfig::default()
-                .max_message_size(Some(LIMIT))
-                .max_frame_size(Some(LIMIT)),
+                .max_message_size(Some(proxy::REQUEST_LIMIT))
+                .max_frame_size(Some(proxy::REQUEST_LIMIT)),
         ),
     )
     .map_err(|_| anyhow::anyhow!("WebSocket handshake rejected or timed out"))?;
+    if is_proxy {
+        ensure!(!busy.load(Ordering::SeqCst), "Login is busy");
+        return proxy::serve(
+            socket,
+            NEXT_ID.fetch_add(1, Ordering::SeqCst),
+            origin,
+            events,
+            stop,
+        );
+    }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Pair {
@@ -224,6 +228,7 @@ fn online(
         pin: String,
     }
     let message = socket.read().context("No pairing request received")?;
+    ensure!(message.len() <= LIMIT, "Pairing message too large");
     ensure!(message.is_text(), "Expected a text pairing request");
     let pair: Pair = serde_json::from_str(message.to_text()?).context("Invalid pairing message")?;
     ensure!(
