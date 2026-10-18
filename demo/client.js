@@ -48,12 +48,13 @@ async function persist(tokens, extra = []) {
   await write([['session', {iv, data}], ...extra]);
 }
 function grant(value) {
-  const actual = typeof value.scope === 'string' ? value.scope.split(/\s+/) : [];
+  const actual = typeof value.scope === 'string' ? value.scope.trim().split(/\s+/) : [];
   if (actual.length !== scopes.length || !scopes.every(s => actual.filter(x => x === s).length === 1) ||
-      value.token_type?.toLowerCase() !== 'bearer' || !value.access_token || !value.refresh_token ||
-      typeof value.access_token !== 'string' || typeof value.refresh_token !== 'string') throw Error('Missing or unexpected granted permissions or tokens.');
+      (typeof value.token_type === 'string' ? value.token_type.toLowerCase() : '') !== 'bearer' || !value.access_token || !value.refresh_token ||
+      typeof value.access_token !== 'string' || typeof value.refresh_token !== 'string' ||
+      value.access_token.length >= 32000 || value.refresh_token.length >= 32000) throw Error('Missing or unexpected granted permissions or tokens.');
 }
-export async function createRequest() {
+export async function createRequest(offline = false) {
   if (!isSecureContext || !navigator.locks || !crypto.subtle) throw Error('Use a current browser over HTTPS or localhost.');
   const pair = await crypto.subtle.generateKey({name: 'RSA-OAEP', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256'}, false, ['encrypt', 'decrypt']);
   return locked(async () => {
@@ -65,7 +66,7 @@ export async function createRequest() {
       scopes, public_key: {kty: key.kty, n: key.n, e: key.e}};
     const raw = JSON.stringify(request);
     // One outstanding request per demo: replacing it deliberately invalidates old files.
-    await write([['pending', {raw, privateKey: pair.privateKey}]]);
+    await write([['pending', {raw, privateKey: pair.privateKey, offline}]]);
     return raw;
   });
 }
@@ -73,14 +74,17 @@ export async function acceptResponse(envelope) {
   return locked(async () => {
     const pending = await read('pending'); if (!pending) throw Error('No pending request in this browser.');
     const request = JSON.parse(pending.raw), hash = await digest(pending.raw);
+    if (!envelope || typeof envelope !== 'object') throw Error('Invalid helper response.');
     if (envelope.version !== 1 || envelope.request_id !== request.request_id || envelope.request_hash !== hash || request.expires_at <= now()) throw Error('Response belongs to a different or expired request.');
+    if (unb64(envelope.iv).length !== 12) throw Error('Invalid response nonce.');
     const rawKey = await crypto.subtle.decrypt({name: 'RSA-OAEP'}, pending.privateKey, unb64(envelope.wrapped_key));
+    if (rawKey.byteLength !== 32) throw Error('Invalid response key.');
     const key = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['decrypt']);
     const tokens = JSON.parse(dec.decode(await crypto.subtle.decrypt({name: 'AES-GCM', iv: unb64(envelope.iv),
       additionalData: enc.encode(`chatgpt-helper-v1:${request.request_id}:${hash}`)}, key, unb64(envelope.ciphertext))));
     grant(tokens);
     if (!Number.isSafeInteger(tokens.expires_at) || tokens.expires_at <= now() || tokens.expires_at > now() + 86400 ||
-        tokens.host_id !== request.host_id || !tokens.subject || typeof tokens.client_id !== 'string' || !/^[\w-]{1,200}$/.test(tokens.client_id) ||
+        tokens.host_id !== request.host_id || typeof tokens.subject !== 'string' || !tokens.subject || typeof tokens.client_id !== 'string' || !/^[\w-]{1,200}$/.test(tokens.client_id) ||
         tokens.client_id === 'dynamic_agent_client' || (request.client_id && tokens.client_id !== request.client_id)) throw Error('Invalid credential binding or expiry.');
     const old = await read('registration');
     if (old && (old.client_id !== tokens.client_id || old.subject !== tokens.subject)) throw Error('Returning registration identity changed.');
@@ -116,6 +120,10 @@ async function access() {
     return tokens.access_token;
   });
 }
+export async function offlinePending() {
+  const pending = await read('pending');
+  return !!(pending?.offline && JSON.parse(pending.raw).expires_at > now());
+}
 export async function connected() { return locked(async () => !!await saved()); }
 export async function models() {
   const response = await http(`${resource}/models`, {headers: {Authorization: `Bearer ${await access()}`}});
@@ -147,9 +155,11 @@ export async function streamText(body, onText) {
 }
 export async function disconnect() {
   return locked(async () => {
-    const tokens = await saved(); let revoked = true;
-    if (tokens) try { await http(`${auth}/revoke`, {method: 'POST', body: new URLSearchParams({token: tokens.refresh_token, token_type_hint: 'refresh_token', client_id: tokens.client_id})}); } catch { revoked = false; }
+    let tokens, revoked = true;
+    try { tokens = await saved(); } catch { revoked = false; }
+    // Clear locally before the network request, including when stored data is corrupt.
     await write([['session', undefined], ['pending', undefined], ['refresh-pending', undefined]]);
+    if (tokens) try { await http(`${auth}/revoke`, {method: 'POST', body: new URLSearchParams({token: tokens.refresh_token, token_type_hint: 'refresh_token', client_id: tokens.client_id})}); } catch { revoked = false; }
     return revoked;
   });
 }

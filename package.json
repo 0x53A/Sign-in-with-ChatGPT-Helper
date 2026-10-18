@@ -1,1 +1,0 @@
-{"name":"chatgpt-login-helper-demo","private":true,"type":"module","scripts":{"test":"node --test tests/*.test.mjs","build":"node tools/build.mjs","test:browser":"node tests/browser.mjs","serve":"node tools/serve.mjs"},"engines":{"node":">=22"},"devDependencies":{"playwright":"^1.64.1"}}

@@ -24,58 +24,59 @@ jobs:
         with:
           node-version: '24'
           cache: npm
+          cache-dependency-path: tests/package-lock.json
       - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev pkg-config
           rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.95.0
-          npm ci
-          npx playwright install --with-deps chromium
+          npm ci --prefix tests
+          npm exec --prefix tests -- playwright install --with-deps chromium
       - name: Check protocol and browser client
         run: |
-          cargo fmt --check
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo test --locked
-          cargo build --locked --examples
-          npm test
-          npm run build
-          WEB_ROOT=target/pages npm run test:browser
+          cargo fmt --manifest-path helper/Cargo.toml --check
+          cargo clippy --manifest-path helper/Cargo.toml --locked --all-targets -- -D warnings
+          cargo test --manifest-path helper/Cargo.toml --locked
+          cargo build --manifest-path helper/Cargo.toml --locked --examples
+          npm test --prefix tests
+          node demo/build.mjs
+          WEB_ROOT=demo/dist npm run test:browser --prefix tests
       - name: Build helper and package exact artifacts
         run: |
-          cargo build --locked --release
-          mkdir -p target/audit
-          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -czf target/audit/site.tar.gz -C target/pages .
-          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -czf target/audit/helper-linux-x86_64.tar.gz -C target/release chatgpt-login-helper
-          sha256sum target/audit/*.tar.gz >> "$GITHUB_STEP_SUMMARY"
+          cargo build --manifest-path helper/Cargo.toml --locked --release
+          mkdir -p tests/artifacts/audit
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -czf tests/artifacts/audit/site.tar.gz -C demo/dist .
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -czf tests/artifacts/audit/helper-linux-x86_64.tar.gz -C helper/target/release chatgpt-login-helper
+          sha256sum tests/artifacts/audit/*.tar.gz >> "$GITHUB_STEP_SUMMARY"
       - name: Attest both artifacts
         id: attest
         uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
         with:
           subject-path: |
-            target/audit/site.tar.gz
-            target/audit/helper-linux-x86_64.tar.gz
+            tests/artifacts/audit/site.tar.gz
+            tests/artifacts/audit/helper-linux-x86_64.tar.gz
       - name: Verify and preserve provenance
         env:
           GH_TOKEN: ${{ github.token }}
           BUNDLE: ${{ steps.attest.outputs.bundle-path }}
           COMMIT: ${{ github.sha }}
         run: |
-          cp "$BUNDLE" target/audit/attestation.jsonl
-          for artifact in target/audit/*.tar.gz; do
+          cp "$BUNDLE" tests/artifacts/audit/attestation.jsonl
+          for artifact in tests/artifacts/audit/*.tar.gz; do
             gh attestation verify "$artifact" --bundle "$BUNDLE" --repo 0x53A/Sign-in-with-ChatGPT-Helper --signer-workflow 0x53A/Sign-in-with-ChatGPT-Helper/.github/workflows/publish.yml --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
           done
-          cp target/audit/site.tar.gz target/audit/attestation.jsonl target/pages/
+          cp tests/artifacts/audit/site.tar.gz tests/artifacts/audit/attestation.jsonl demo/dist/
       - name: Preserve helper and website evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: helper-audit-${{ github.sha }}
-          path: target/audit/
+          path: tests/artifacts/audit/
           if-no-files-found: error
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
-          path: target/pages
+          path: demo/dist
   deploy:
     needs: build
     runs-on: ubuntu-24.04

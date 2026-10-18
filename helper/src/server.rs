@@ -1,3 +1,5 @@
+//! Loopback transport. Workers queue requests; only the GUI approves them.
+//! The GUI holds the busy flag through login and the result screen, not per socket.
 use crate::{
     auth,
     protocol::{self, Envelope, LIMIT, Request},
@@ -8,7 +10,7 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Sender},
     },
     thread,
@@ -20,18 +22,22 @@ use tungstenite::{
     protocol::WebSocketConfig,
 };
 
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub struct Pending {
+    pub id: u64,
     pub request: Request,
-    pub origin_verified: bool,
-    pub pin: Option<String>,
+    pub pin: String,
     pub answer: Sender<bool>,
     pub cancelled: Arc<AtomicBool>,
-    pub deadline: Instant,
+}
+pub enum Delivery {
+    Online,
+    Offline(Envelope),
 }
 pub enum Event {
     Pending(Pending),
-    Status(String, Option<String>),
-    Finished(Result<Option<Envelope>, String>),
+    Status(u64, String, Option<String>),
+    Finished(u64, Result<Delivery, String>),
 }
 pub struct Listener {
     stop: Arc<AtomicBool>,
@@ -45,14 +51,14 @@ impl Drop for Listener {
         }
     }
 }
-struct Busy(Arc<AtomicBool>);
-impl Drop for Busy {
+struct Connection(Arc<AtomicUsize>);
+impl Drop for Connection {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-pub fn handshake_origin(req: &Handshake, port: u16) -> Result<String> {
+fn handshake_origin(req: &Handshake, port: u16) -> Result<String> {
     ensure!(
         req.uri().path() == "/pair" && req.uri().query().is_none(),
         "Invalid WebSocket path"
@@ -82,26 +88,23 @@ pub fn start(port: u16, events: Sender<Event>, busy: Arc<AtomicBool>) -> Result<
     listener.set_nonblocking(true)?;
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
+    let connections = Arc::new(AtomicUsize::new(0));
     let thread = thread::spawn(move || {
         while !stopped.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    if busy
-                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_err()
-                    {
+                    if busy.load(Ordering::SeqCst) || connections.load(Ordering::SeqCst) >= 16 {
                         drop(stream);
                         continue;
                     }
-                    let guard = Busy(busy.clone());
+                    connections.fetch_add(1, Ordering::SeqCst);
+                    let guard = Connection(connections.clone());
                     let events = events.clone();
                     let stopped = stopped.clone();
+                    let busy = busy.clone();
                     thread::spawn(move || {
                         let _guard = guard;
-                        let result = online(stream, port, &events, stopped);
-                        let _ = events.send(Event::Finished(
-                            result.map(|_| None).map_err(|e| e.to_string()),
-                        ));
+                        let _ = online(stream, port, &events, stopped, busy);
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -131,47 +134,48 @@ fn disconnected(socket: &mut WebSocket<TcpStream>) -> bool {
     }
 }
 fn exchange(
+    id: u64,
     raw: &str,
     pin: Option<String>,
-    verified: bool,
+    cancelled: Arc<AtomicBool>,
     events: &Sender<Event>,
     mut disconnected: impl FnMut() -> bool,
 ) -> Result<Envelope> {
     let request = Request::parse(raw)?;
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = mpsc::channel();
-    let deadline = Instant::now() + Duration::from_secs(120);
-    events.send(Event::Pending(Pending {
-        request: request.clone(),
-        origin_verified: verified,
-        pin,
-        answer: tx,
-        cancelled: cancelled.clone(),
-        deadline,
-    }))?;
     let outcome = (|| {
-        loop {
-            ensure!(
-                !disconnected() && !cancelled.load(Ordering::SeqCst),
-                "Pairing connection closed or cancelled"
-            );
-            ensure!(
-                Instant::now() < deadline && protocol::now() < request.expires_at,
-                "Pairing request expired"
-            );
-            match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(true) => break,
-                Ok(false) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    anyhow::bail!("Pairing rejected")
+        if let Some(pin) = pin {
+            let (tx, rx) = mpsc::channel();
+            let deadline = Instant::now() + Duration::from_secs(120);
+            events.send(Event::Pending(Pending {
+                id,
+                request: request.clone(),
+                pin,
+                answer: tx,
+                cancelled: cancelled.clone(),
+            }))?;
+            loop {
+                ensure!(
+                    !cancelled.load(Ordering::SeqCst) && !disconnected(),
+                    "Pairing connection closed or cancelled"
+                );
+                ensure!(
+                    Instant::now() < deadline && protocol::now() < request.expires_at,
+                    "Pairing request expired"
+                );
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(true) => break,
+                    Ok(false) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        anyhow::bail!("Pairing rejected")
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => (),
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => (),
             }
         }
         let tokens = auth::authorize(
             &request,
             || cancelled.load(Ordering::SeqCst) || disconnected(),
             |message, url| {
-                let _ = events.send(Event::Status(message, url));
+                let _ = events.send(Event::Status(id, message, url));
             },
         )?;
         ensure!(
@@ -189,6 +193,7 @@ fn online(
     port: u16,
     events: &Sender<Event>,
     stop: Arc<AtomicBool>,
+    busy: Arc<AtomicBool>,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -232,14 +237,21 @@ fn online(
     socket
         .get_mut()
         .set_read_timeout(Some(Duration::from_millis(100)))?;
-    let result = exchange(&pair.request, Some(pair.pin), true, events, || {
-        stop.load(Ordering::SeqCst) || disconnected(&mut socket)
-    });
-    match result {
+    ensure!(!busy.load(Ordering::SeqCst), "Login is busy");
+    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+    let result = exchange(
+        id,
+        &pair.request,
+        Some(pair.pin),
+        Arc::new(AtomicBool::new(false)),
+        events,
+        || stop.load(Ordering::SeqCst) || disconnected(&mut socket),
+    );
+    let delivered = match result {
         Ok(envelope) => {
-            socket.send(Message::Text(serde_json::to_string(&envelope)?.into()))?;
+            let sent = socket.send(Message::Text(serde_json::to_string(&envelope)?.into()));
             let _ = socket.close(None);
-            Ok(())
+            sent.map_err(anyhow::Error::from)
         }
         Err(e) => {
             let _ = socket.send(Message::Text(
@@ -250,21 +262,26 @@ fn online(
             let _ = socket.close(None);
             Err(e)
         }
-    }
-}
-pub fn offline(raw: String, events: Sender<Event>, busy: Arc<AtomicBool>) -> Result<()> {
-    Request::parse(&raw)?;
-    ensure!(
-        busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok(),
-        "Another request is active"
-    );
-    thread::spawn(move || {
-        let _guard = Busy(busy);
-        let result = exchange(&raw, None, false, &events, || false);
-        let _ = events.send(Event::Finished(result.map(Some).map_err(|e| e.to_string())));
-    });
+    };
+    let _ = events.send(Event::Finished(
+        id,
+        delivered
+            .map(|_| Delivery::Online)
+            .map_err(|e| e.to_string()),
+    ));
     Ok(())
+}
+pub fn offline(raw: String, events: Sender<Event>, cancelled: Arc<AtomicBool>) -> Result<u64> {
+    Request::parse(&raw)?;
+    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+    thread::spawn(move || {
+        let result = exchange(id, &raw, None, cancelled, &events, || false);
+        let _ = events.send(Event::Finished(
+            id,
+            result.map(Delivery::Offline).map_err(|e| e.to_string()),
+        ));
+    });
+    Ok(id)
 }
 #[cfg(test)]
 mod tests {

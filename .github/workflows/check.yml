@@ -13,18 +13,19 @@ jobs:
         with:
           node-version: '24'
           cache: npm
+          cache-dependency-path: tests/package-lock.json
       - run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev pkg-config
           rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.95.0
-          npm ci
-          npx playwright install --with-deps chromium
+          npm ci --prefix tests
+          npm exec --prefix tests -- playwright install --with-deps chromium
       - run: |
-          cargo fmt --check
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo test --locked
-          cargo build --locked --examples
-          npm test
-          npm run build
-          WEB_ROOT=target/pages npm run test:browser
+          cargo fmt --manifest-path helper/Cargo.toml --check
+          cargo clippy --manifest-path helper/Cargo.toml --locked --all-targets -- -D warnings
+          cargo test --manifest-path helper/Cargo.toml --locked
+          cargo build --manifest-path helper/Cargo.toml --locked --examples
+          npm test --prefix tests
+          node demo/build.mjs
+          WEB_ROOT=demo/dist npm run test:browser --prefix tests

@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {zip, unzip} from '../web/zip.js';
-import {streamText} from '../web/client.js';
+import {zip, unzip} from '../demo/zip.js';
+import {streamText} from '../demo/client.js';
 test('ZIP transport round trip and tampering', () => {
   const value = zip('request.json', '{"origin":"https://example.com","name":"水"}');
   assert.match(unzip(value, 'request.json'), /水/);

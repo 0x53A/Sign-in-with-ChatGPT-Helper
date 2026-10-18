@@ -1,3 +1,5 @@
+//! OpenAI OAuth only: fixed endpoints, PKCE/state, verified identity and exact grants.
+//! Disk storage contains registration metadata, never bearer tokens.
 use crate::protocol::{Request, SCOPES, Tokens, hash, now, random};
 use anyhow::{Context, Result, bail, ensure};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
@@ -14,7 +16,7 @@ use std::{
 const ISSUER: &str = "https://auth.openai.com";
 const RESOURCE: &str = "https://api.openai.com/v1";
 
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Registration {
     client_id: String,
     subject: Option<String>,
@@ -40,7 +42,7 @@ fn save(key: &str, registration: &Registration) -> Result<()> {
     fs::create_dir_all(path.parent().unwrap())?;
     let mut all = registrations()?;
     all.insert(key.into(), registration.clone());
-    let temp = path.with_extension(format!("{}.tmp", random()));
+    let temp = path.with_extension(format!("{}.tmp", random()?));
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -68,12 +70,13 @@ fn json(response: reqwest::blocking::Response, stage: &str) -> Result<serde_json
 }
 
 #[derive(Deserialize, Clone)]
-pub struct Identity {
-    pub sub: String,
-    pub nonce: String,
+struct Identity {
+    sub: String,
+    nonce: String,
+    iat: u64,
 }
 
-pub fn verify(token: &str, client: &str, nonce: &str, keys: &JwkSet) -> Result<Identity> {
+fn verify(token: &str, client: &str, nonce: &str, keys: &JwkSet) -> Result<Identity> {
     let header = decode_header(token).context("Invalid identity token")?;
     ensure!(
         header.alg == Algorithm::RS256,
@@ -96,17 +99,13 @@ pub fn verify(token: &str, client: &str, nonce: &str, keys: &JwkSet) -> Result<I
         .context("Identity verification failed")?
         .claims;
     ensure!(
-        !identity.sub.is_empty() && identity.nonce == nonce,
-        "Identity subject/nonce mismatch"
+        !identity.sub.is_empty() && identity.nonce == nonce && identity.iat <= now() + 5,
+        "Identity subject, nonce or issued-at time is invalid"
     );
     Ok(identity)
 }
 
-pub fn check_callback(
-    query: &str,
-    state: &str,
-    existing: Option<&str>,
-) -> Result<(String, String)> {
+fn check_callback(query: &str, state: &str, existing: Option<&str>) -> Result<(String, String)> {
     let pairs: Vec<_> = url::form_urlencoded::parse(query.as_bytes()).collect();
     let get = |name: &str| -> Result<Option<String>> {
         let values: Vec<_> = pairs.iter().filter(|(k, _)| k == name).collect();
@@ -140,7 +139,7 @@ pub fn check_callback(
     Ok((client, code))
 }
 
-pub fn validate_grant(value: &serde_json::Value) -> Result<()> {
+fn validate_grant(value: &serde_json::Value) -> Result<()> {
     let scope: Vec<_> = value["scope"]
         .as_str()
         .unwrap_or("")
@@ -176,11 +175,12 @@ pub fn validate_grant(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-pub fn authorize(
+pub(crate) fn authorize(
     request: &Request,
     mut cancelled: impl FnMut() -> bool,
     mut status: impl FnMut(String, Option<String>),
 ) -> Result<Tokens> {
+    ensure!(!cancelled(), "Sign-in cancelled");
     let client = Client::builder()
         .timeout(Duration::from_secs(25))
         .redirect(reqwest::redirect::Policy::none())
@@ -210,9 +210,9 @@ pub fn authorize(
         .to_ip()
         .context("Missing callback listener")?;
     let redirect = format!("http://{address}/auth/callback");
-    let state = random();
-    let nonce = random();
-    let verifier = random();
+    let state = random()?;
+    let nonce = random()?;
+    let verifier = random()?;
     let mut url = url::Url::parse(&format!("{ISSUER}/api/accounts/authorize"))?;
     url.query_pairs_mut().extend_pairs([
         ("client_id", existing.unwrap_or("dynamic_agent_client")),
@@ -230,16 +230,8 @@ pub fn authorize(
         url.query_pairs_mut()
             .append_pair("agent_name_hint", &request.app_name);
     }
-    status(
-        "Complete sign-in in your browser.".into(),
-        Some(url.to_string()),
-    );
-    if webbrowser::open(url.as_str()).is_err() {
-        status(
-            "Could not open browser. Use the sign-in link below.".into(),
-            Some(url.to_string()),
-        );
-    }
+    status(String::new(), Some(url.to_string()));
+    ensure!(!cancelled(), "Sign-in cancelled");
     let deadline = Instant::now() + Duration::from_secs(600);
     let (issued, code) = loop {
         ensure!(!cancelled(), "Sign-in cancelled");
@@ -251,15 +243,16 @@ pub fn authorize(
             continue;
         };
         let parsed = url::Url::parse(&format!("http://{address}{}", incoming.url()));
-        let host = incoming
+        let hosts: Vec<_> = incoming
             .headers()
             .iter()
-            .find(|h| h.field.equiv("Host"))
-            .map(|h| h.value.as_str());
+            .filter(|h| h.field.equiv("Host"))
+            .map(|h| h.value.as_str())
+            .collect();
         let accepted = parsed.as_ref().is_ok_and(|u| {
             u.path() == "/auth/callback" && u.query_pairs().any(|(k, v)| k == "state" && v == state)
         }) && incoming.method() == &tiny_http::Method::Get
-            && host == Some(address.to_string().as_str());
+            && hosts == [address.to_string().as_str()];
         let reply = |text, code| {
             tiny_http::Response::from_string(text)
                 .with_status_code(code)
@@ -360,18 +353,31 @@ mod tests {
     use super::*;
     #[test]
     fn signed_identity_is_required_and_bound() {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-        use rsa::{
-            RsaPrivateKey, pkcs8::EncodePrivateKey, rand_core::OsRng, traits::PublicKeyParts,
+        use aws_lc_rs::{
+            rand::SystemRandom,
+            rsa::KeySize,
+            signature::{KeyPair, RSA_PKCS1_SHA256, RsaKeyPair, RsaPublicKeyComponents},
         };
-        let key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
-        let pem = key.to_pkcs8_pem(Default::default()).unwrap();
-        let signing = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
-        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
-        header.kid = Some("fixture".into());
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let key = RsaKeyPair::generate(KeySize::Rsa2048).unwrap();
+        let public = RsaPublicKeyComponents::<Vec<u8>>::from(key.public_key());
+        let sign = |claims: &serde_json::Value| {
+            let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","kid":"fixture"}"#);
+            let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+            let message = format!("{header}.{payload}");
+            let mut signature = vec![0; key.public_modulus_len()];
+            key.sign(
+                &RSA_PKCS1_SHA256,
+                &SystemRandom::new(),
+                message.as_bytes(),
+                &mut signature,
+            )
+            .unwrap();
+            format!("{message}.{}", URL_SAFE_NO_PAD.encode(signature))
+        };
         let claims = serde_json::json!({"sub":"fixture-subject", "nonce":"nonce", "aud":"client", "iss":ISSUER, "iat":now(), "exp":now()+60});
-        let token = jsonwebtoken::encode(&header, &claims, &signing).unwrap();
-        let keys: JwkSet = serde_json::from_value(serde_json::json!({"keys":[{"kty":"RSA", "kid":"fixture", "alg":"RS256", "n":URL_SAFE_NO_PAD.encode(key.n().to_bytes_be()), "e":URL_SAFE_NO_PAD.encode(key.e().to_bytes_be())}]})).unwrap();
+        let token = sign(&claims);
+        let keys: JwkSet = serde_json::from_value(serde_json::json!({"keys":[{"kty":"RSA", "kid":"fixture", "alg":"RS256", "n":URL_SAFE_NO_PAD.encode(&public.n), "e":URL_SAFE_NO_PAD.encode(&public.e)}]})).unwrap();
         assert_eq!(
             verify(&token, "client", "nonce", &keys).unwrap().sub,
             "fixture-subject"
@@ -380,26 +386,15 @@ mod tests {
         assert!(verify(&token, "client", "other", &keys).is_err());
         let mut expired = claims.clone();
         expired["exp"] = (now() - 60).into();
-        assert!(
-            verify(
-                &jsonwebtoken::encode(&header, &expired, &signing).unwrap(),
-                "client",
-                "nonce",
-                &keys
-            )
-            .is_err()
-        );
+        assert!(verify(&sign(&expired), "client", "nonce", &keys).is_err());
+        let mut future = claims.clone();
+        future["iat"] = (now() + 60).into();
+        assert!(verify(&sign(&future), "client", "nonce", &keys).is_err());
+        future.as_object_mut().unwrap().remove("iat");
+        assert!(verify(&sign(&future), "client", "nonce", &keys).is_err());
         let mut wrong = claims;
         wrong["iss"] = "https://evil.example".into();
-        assert!(
-            verify(
-                &jsonwebtoken::encode(&header, &wrong, &signing).unwrap(),
-                "client",
-                "nonce",
-                &keys
-            )
-            .is_err()
-        );
+        assert!(verify(&sign(&wrong), "client", "nonce", &keys).is_err());
         let mut broken = token.into_bytes();
         let at = broken.len() - 10;
         broken[at] = if broken[at] == b'A' { b'B' } else { b'A' };

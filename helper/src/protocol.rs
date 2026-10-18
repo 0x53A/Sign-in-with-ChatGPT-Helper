@@ -1,16 +1,15 @@
-use aes_gcm::{
-    Aes256Gcm, KeyInit, Nonce,
-    aead::{Aead, Payload},
-};
+//! Untrusted request validation, bounded ZIP transport and recipient encryption.
+//! The browser keeps the RSA private key; we use only its public key.
 use anyhow::{Context, Result, bail, ensure};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
-use rsa::{
-    BigUint, Oaep, RsaPublicKey,
-    rand_core::{OsRng, RngCore},
-    traits::PublicKeyParts,
+use aws_lc_rs::{
+    aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey},
+    digest::{SHA256, digest},
+    rand,
+    rsa::{OAEP_SHA256_MGF1SHA256, OaepPublicEncryptingKey, PublicEncryptingKey},
+    signature::RsaPublicKeyComponents,
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     io::{Cursor, Read, Write},
     time::{SystemTime, UNIX_EPOCH},
@@ -31,13 +30,13 @@ pub fn now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-pub fn random() -> String {
+pub fn random() -> Result<String> {
     let mut b = [0u8; 32];
-    OsRng.fill_bytes(&mut b);
-    B64.encode(b)
+    rand::fill(&mut b)?;
+    Ok(B64.encode(b))
 }
 pub fn hash(bytes: &[u8]) -> String {
-    B64.encode(Sha256::digest(bytes))
+    B64.encode(digest(&SHA256, bytes).as_ref())
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -134,19 +133,20 @@ impl Request {
         request.key()?;
         Ok(request)
     }
-    pub fn key(&self) -> Result<RsaPublicKey> {
+    fn key(&self) -> Result<PublicEncryptingKey> {
         ensure!(
             self.public_key.kty == "RSA"
                 && self.public_key.n.len() <= 700
                 && self.public_key.e == "AQAB",
             "Expected RSA key with exponent 65537"
         );
-        let key = RsaPublicKey::new(
-            BigUint::from_bytes_be(&B64.decode(&self.public_key.n)?),
-            BigUint::from(65537u32),
-        )?;
+        let key: PublicEncryptingKey = RsaPublicKeyComponents {
+            n: B64.decode(&self.public_key.n)?,
+            e: B64.decode(&self.public_key.e)?,
+        }
+        .try_into()?;
         ensure!(
-            (2048..=4096).contains(&key.n().bits()),
+            (2048..=4096).contains(&key.key_size_bits()),
             "RSA key must be 2048–4096 bits"
         );
         Ok(key)
@@ -183,24 +183,19 @@ pub fn encrypt(raw: &str, request: &Request, tokens: &Tokens) -> Result<Envelope
     );
     let mut key = [0u8; 32];
     let mut iv = [0u8; 12];
-    OsRng.fill_bytes(&mut key);
-    OsRng.fill_bytes(&mut iv);
+    rand::fill(&mut key)?;
+    rand::fill(&mut iv)?;
     let request_hash = hash(raw.as_bytes());
     let aad = format!("chatgpt-helper-v1:{}:{}", request.request_id, request_hash);
-    let plaintext = serde_json::to_vec(tokens)?;
-    let ciphertext = Aes256Gcm::new_from_slice(&key)
-        .unwrap()
-        .encrypt(
-            &Nonce::from(iv),
-            Payload {
-                msg: &plaintext,
-                aad: aad.as_bytes(),
-            },
-        )
-        .map_err(|_| anyhow::anyhow!("Encryption failed"))?;
-    let wrapped = request
-        .key()?
-        .encrypt(&mut OsRng, Oaep::new::<rsa::sha2::Sha256>(), &key)?;
+    let mut ciphertext = serde_json::to_vec(tokens)?;
+    LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key)?).seal_in_place_append_tag(
+        Nonce::assume_unique_for_key(iv),
+        Aad::from(aad.as_bytes()),
+        &mut ciphertext,
+    )?;
+    let recipient = OaepPublicEncryptingKey::new(request.key()?)?;
+    let mut wrapped = vec![0; recipient.ciphertext_size()];
+    recipient.encrypt(&OAEP_SHA256_MGF1SHA256, &key, &mut wrapped, None)?;
     Ok(Envelope {
         version: 1,
         request_id: request.request_id.clone(),
@@ -217,7 +212,9 @@ pub fn read_package(bytes: &[u8], name: &str) -> Result<String> {
     ensure!(zip.len() == 1, "Package must contain exactly one JSON file");
     let mut file = zip.by_index(0)?;
     ensure!(
-        file.name()? == name && file.size() <= LIMIT as u64,
+        file.name()? == name
+            && file.size() <= LIMIT as u64
+            && file.compression() == zip::CompressionMethod::Stored,
         "Unexpected ZIP entry"
     );
     let mut result = String::new();

@@ -1,0 +1,16 @@
+{
+  "name": "chatgpt-login-helper-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test *.test.mjs",
+    "test:browser": "node browser.mjs",
+    "test:native": "node native-smoke.mjs"
+  },
+  "engines": {
+    "node": ">=22.7"
+  },
+  "devDependencies": {
+    "playwright": "^1.64.1"
+  }
+}

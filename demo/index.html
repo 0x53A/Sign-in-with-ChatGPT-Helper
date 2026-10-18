@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' ws://127.0.0.1:* https://auth.openai.com https://api.openai.com; img-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
+<title>Login with OpenAI · Demo</title>
+<link rel="stylesheet" href="style.css">
+<main>
+  <header><h1>Login with OpenAI</h1><span>DEMO</span></header>
+  <section aria-label="Login">
+    <div id="login" hidden>
+      <div class="row"><button id="connect">Connect to helper</button><button id="request">Download Offline Package</button></div>
+      <div id="online" hidden>
+        <label>Helper port <input id="port" type="number" min="1" max="65535" value="17653"></label>
+        <p id="pair" hidden>Enter <strong id="pin"></strong> in the helper.</p>
+        <button id="cancel" hidden>Cancel</button>
+      </div>
+      <div id="offline" hidden><p>Open the package in the helper, then import the result.</p><label class="file">Import result <input id="response" type="file" accept=".zip"></label></div>
+    </div>
+    <div id="success" class="row" hidden><strong id="login-state">Login Success</strong><button id="disconnect">Logout</button></div>
+  </section>
+  <section id="inference" aria-label="Inference" hidden><div class="row"><label class="grow">Model <select id="model" disabled><option value="">Loading models…</option></select></label><button id="reload" disabled>Reload models</button></div>
+    <label>Message <textarea id="prompt" rows="3" placeholder="Ask something…"></textarea></label><button id="send" disabled>Send</button>
+    <pre id="output" aria-live="polite"></pre>
+  </section>
+  <p id="status" role="status" hidden></p>
+  <footer><a href="https://github.com/0x53A/Sign-in-with-ChatGPT-Helper">Source &amp; helper</a><a href="build.json">Build evidence</a></footer>
+</main>
+<script type="module" src="app.js"></script>
+</html>

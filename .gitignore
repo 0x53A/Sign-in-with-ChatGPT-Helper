@@ -1,4 +1,8 @@
-/target
-/node_modules
+/helper/target
+/demo/dist
+/tests/node_modules
+/tests/artifacts
 /.direnv
 /result
+# An editor opened before the Cargo move may still write diagnostics here.
+/target
