@@ -32,6 +32,7 @@ pub struct Session {
     pub id: u64,
     pub origin: String,
     pub requests: AtomicU64,
+    pub last_request: AtomicU64,
     pub stopped: AtomicBool,
     pub limited: AtomicBool,
     socket: TcpStream,
@@ -518,6 +519,7 @@ fn serve_with(
         id,
         origin,
         requests: AtomicU64::new(0),
+        last_request: AtomicU64::new(0),
         stopped: AtomicBool::new(false),
         limited: AtomicBool::new(true),
         socket: socket.get_ref().try_clone()?,
@@ -593,6 +595,9 @@ fn serve_with(
                 ensure!(id > last_id, "Request IDs must increase from 1");
                 last_id = id;
                 session.requests.fetch_add(1, Ordering::SeqCst);
+                session
+                    .last_request
+                    .store(protocol::now(), Ordering::SeqCst);
                 let within_rate = rate.take(Instant::now(), 30);
                 if session.limited.load(Ordering::SeqCst) {
                     if !within_rate {
@@ -775,6 +780,7 @@ mod tests {
             panic!("expected approval request")
         };
         assert_eq!(pending.session.requests.load(Ordering::SeqCst), 0);
+        assert_eq!(pending.session.last_request.load(Ordering::SeqCst), 0);
         if let tungstenite::stream::MaybeTlsStream::Plain(stream) = client.get_mut() {
             stream
                 .set_read_timeout(Some(Duration::from_millis(200)))
@@ -788,6 +794,7 @@ mod tests {
                 .unwrap();
         }
         assert!(client.read().unwrap().to_text().unwrap().contains("ready"));
+        let before_request = protocol::now();
         client
             .send(Message::Text(
                 r#"{"type":"request","id":1,"request":{"endpoint":"unknown"}}"#.into(),
@@ -804,6 +811,10 @@ mod tests {
         pending.session.stop();
         let _ = worker.join().unwrap();
         assert_eq!(pending.session.requests.load(Ordering::SeqCst), 1);
+        assert!(
+            (before_request..=protocol::now())
+                .contains(&pending.session.last_request.load(Ordering::SeqCst))
+        );
         assert!(pending.session.stopped.load(Ordering::SeqCst));
     }
     // A synthetic worker exercises the real coordinator and wire framing without

@@ -433,6 +433,19 @@ impl App {
                                 }
                             }
                         });
+                        if row.approved {
+                            let last = row.pending.session.last_request.load(Ordering::SeqCst);
+                            ui.weak(if last == 0 {
+                                "Last request: —".into()
+                            } else {
+                                format!(
+                                    "Last request: {:02}:{:02}:{:02} UTC",
+                                    last / 3600 % 24,
+                                    last / 60 % 60,
+                                    last % 60
+                                )
+                            });
+                        }
                         ui.add_space(8.0);
                     });
                 }

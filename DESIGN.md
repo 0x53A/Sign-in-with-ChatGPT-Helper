@@ -16,7 +16,8 @@ Login replaces the list with Open in Browser and, beneath it, Copy Link to Clipb
 Never launch a browser automatically. Completion shows Close, plus Save result for offline
 handoff. Close returns to the listener. Keep explanatory prose in documentation.
 Proxy rows show the verified browser origin and Approve/Reject. Approved sessions
-show a request count and Stop; keep those controls visible during login. Each row
+show a request count and Stop, followed by Last request: HH:MM:SS UTC (a dash
+until the first request); keep those controls visible during login. Each row
 also has a checked-by-default Rate limit checkbox (30/minute, two concurrent
 requests), editable before and after approval. Unchecking removes both limits.
 No credential viewer or plaintext export.

@@ -202,7 +202,9 @@ malicious native software with access to the helper key or process memory.
 The same loopback listener accepts WebSocket `/proxy`. Host/Origin checks are
 identical to pairing. Each connection queues a native Approve/Reject row with its
 browser origin; approval is never inherited by a reconnect. Approved rows show
-request counts and Stop. Each row has a checked-by-default Rate limit checkbox,
+request counts, the last request time (HH:MM:SS UTC, or a dash before the first
+request), and Stop. The timestamp includes rejected request attempts and stays
+in memory for that connection only. Each row has a checked-by-default Rate limit checkbox,
 editable before or after approval. Disabling the listener, changing port, exiting the helper,
 Stop, or closing the page terminates sessions. Existing approved sessions remain
 visible during another login; new approvals wait until its result is closed.
